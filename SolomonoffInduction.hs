@@ -1,5 +1,6 @@
+module SolomonoffInduction where
 {-# LANGUAGE ConstraintKinds #-}
-module SolomonoffInduction (solomonoffInduction) where
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 import Prelude hiding (Real)
 import Control.Applicative
 import System.Random (randomRIO)
@@ -8,6 +9,10 @@ ifM :: Monad m => m Bool -> m a -> m a -> m a
 ifM p t e = p >>= \x -> if x then t else e
 
 data Bit = Zero | One deriving (Eq, Ord, Show, Enum)
+
+toBool :: Bit -> Bool
+toBool One = True
+toBool Zero = False
 
 fromBool :: Bool -> Bit
 fromBool True = One
@@ -20,6 +25,9 @@ len (M i) = ceiling (logBase 2 (fromIntegral i) :: Double)
 
 allMachines :: Stream Machine
 allMachines = M <$> makeStream (+1) 0
+
+machineEncodingReal :: POM m => Real m -> Machine
+machineEncodingReal = undefined
 
 data Stream a = a :! Stream a
 instance Functor Stream where
@@ -39,11 +47,18 @@ streamTake :: Int -> Stream a -> [a]
 streamTake 0 _ = []
 streamTake n (x:!xs) = x : streamTake (n-1) xs
 
+streamFind :: (a -> Bool) -> Stream a -> a
+streamFind f (x:!xs) = if f x then x else streamFind f xs
+
 streamZipWith :: (a -> b -> c) -> Stream a -> Stream b -> Stream c
 streamZipWith f (x :! xs) (y :! ys) = f x y :! streamZipWith f xs ys
 
 streamZip :: Stream a -> Stream b -> Stream (a, b)
 streamZip = streamZipWith (,)
+
+first :: Stream (Maybe a) -> a
+first (Nothing:!xs) = first xs
+first (Just x:!_) = x
 
 type Bounds = (Rational, Rational)
 
@@ -63,6 +78,9 @@ instance ProbabilisticMachine IO where
 	tossCoin = fromBool <$> randomRIO (False, True)
 
 type POM m = (Functor m, Applicative m, Monad m, OracleMachine m, ProbabilisticMachine m)
+
+genCoinSequence :: POM m => Stream (m Bit)
+genCoinSequence = tossCoin :! genCoinSequence
 
 type Real m = Stream (m Bounds)
 
@@ -138,6 +156,9 @@ getStringProb m bs = realProduct [getProb m bs' b' | (bs', b') <- observations b
 realProduct :: POM m => [Real m] -> Real m
 realProduct = foldr (liftR2 (*)) oneR
 
+realSum :: POM m => [Real m] -> Real m
+realSum = foldr (liftR2 (+)) zeroR
+
 oneMinus :: POM m => Real m -> Real m
 oneMinus = liftR1 (1-)
 
@@ -172,3 +193,26 @@ solomonoffInduction bs = pickM >>= \m -> flipR (getProb m bs One) where
 		let decisions = (fmap (== LT) . compareR rand) <$> cutoffs
 		let findMachine ((m, isSelected):!xs) = ifM isSelected (pure m) (findMachine xs)
 		findMachine $ streamZip allMachines decisions
+
+type Action = Bit
+newtype Observation = O
+	{ sense :: Int
+	, reward :: Int
+	} deriving (Eq, Ord, Enum, Num, Read, Show)
+obsToBits :: Observation -> [Bit]
+obsToBit = undefined
+
+type History = (Observation, [(Observation, Action)])
+
+type Environment = [(Observation, Action)] -> Observation
+castToEnv :: Machine -> Environment
+castToEnv = undefined
+
+type Agent = History -> Action
+
+getEnvProb :: POM m => Machine -> [(Observation, Action)] -> Observation -> Real m
+getEnvProb m h o = undefined
+
+getHistProb :: POM m => Machine -> History -> Real m
+getHistProb m h = realProduct [getEnvProb m h' o | (h', o) <- observations h]
+	where observations xs = [(take n xs, xs !! n) | n <- [0 .. length xs - 1]]
