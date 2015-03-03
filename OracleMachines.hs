@@ -42,6 +42,13 @@ streamZip = streamZipWith (,)
 streamFindM :: Monad m => (a -> m Bool) -> Stream a -> m a
 streamFindM predM (x:!xs) = ifM (predM x) (return x) (streamFindM predM xs)
 
+streamConcat :: [a] -> Stream a -> Stream a
+streamConcat [] xs = xs
+streamConcat (x:xs) ys = x :! streamConcat xs ys
+
+naturals :: Stream Integer
+naturals = makeStream succ 0
+
 -- A bit datatype.
 -- We could just use Bool, but it's nice to leverage the type system where possible.
 data Bit = Zero | One deriving (Eq, Ord, Read, Show, Enum)
@@ -72,7 +79,7 @@ prior m = 2 ^ negate (len m)
 -- TODO: this violates the condition that sum [2^(- len m) | m <-
 -- allMachines] == 1 assumption.
 allMachines :: Stream Machine
-allMachines = M <$> makeStream succ 0
+allMachines = M <$> naturals
 
 -- Probabilistic oracle machines.
 -- Remember, these are Turing machines that can flip coins and call oracles.
@@ -228,7 +235,7 @@ getStringProb bits m = realProduct [getProb bit prev m | (prev, bit) <- events b
 -- Translation: this can be used to figure out the probability of a given
 -- string being generated *in general*.
 pOverMachines :: POM m => (Machine -> Real m) -> Real m
-pOverMachines bias = nthApprox <$> makeStream succ 0 where
+pOverMachines bias = nthApprox <$> naturals where
 	nthApprox n = do
 		let machines = streamTake n allMachines
 		bounds <- sequence [streamGet n $ bias m | m <- machines]
@@ -352,52 +359,53 @@ envInductor (EnvHistory bits mm hist) = getM >>= \m -> (m,) <$> predict m where
 
 -- Runs the interaction of an agent with an environment, starting with an
 -- environment (which may be partway through outputting an observation).
-interactE :: POM m => Agent m -> Environment m -> EnvHistory -> m (Stream OA)
-interactE agent env hist = if isObservation $ partialO hist then a else e where
-	a = interactA agent env newAhist
-	e = env hist >>= interactE agent env . newEhist
+stepE :: POM m => Agent m -> Environment m -> EnvHistory -> m (Stream OA)
+stepE agent env hist = if isObservation $ partialO hist then a else e where
+	a = stepA agent env newAhist
+	e = env hist >>= stepE agent env . newEhist
 	newAhist = AgentHistory [] (partialO hist) (prevHistE hist)
 	newEhist (m, bit) = hist{partialO = bit : partialO hist, currentM = Just m}
 
 -- Runs the interaction of an agent with an environment, starting with an agent
 -- (which may be partway through outputting an action.)
-interactA :: POM m => Agent m -> Environment m -> AgentHistory -> m (Stream OA)
-interactA agent env hist = if isAction $ partialA hist then e else a where
-	e = ((currentO hist, partialA hist):!) <$> interactE agent env newEhist
-	a = agent hist >>= interactA agent env . newAhist
+stepA :: POM m => Agent m -> Environment m -> AgentHistory -> m (Stream OA)
+stepA agent env hist = if isAction $ partialA hist then e else a where
+	e = ((currentO hist, partialA hist):!) <$> stepE agent env newEhist
+	a = agent hist >>= stepA agent env . newAhist
 	newEhist = EnvHistory [] Nothing $ (currentO hist, partialA hist) : prevHistA hist
 	newAhist bit = hist{partialA = bit : partialA hist}
 
 -- Runs the interaction of an agent with an environment, starting with the
 -- environment outputting a fresh observation.
 interact :: POM m => Agent m -> Environment m -> History -> m (Stream OA)
-interact agent env hist = interactE agent env (EnvHistory [] Nothing hist)
+interact agent env hist = stepE agent env (EnvHistory [] Nothing hist)
 
 -- Computes the reward of an agent interacting with an environment.
 -- Computes better and better approximations to this sum (as a series of nested
 -- intervals). Guaranteed to converge (if rewards are on [0, 1]) due to
 -- time-discounting.
-reward :: POM m => Agent m -> Environment m -> AgentHistory -> Real m
-reward agent env hist = approx <$> makeStream succ (0 :: Integer) where
-	approx n = do
-		future <- interactA agent env hist
-		let relevant = streamTake n future
-		return (rewardsIn n relevant + maxDiscountedReward n, rewardsIn n relevant)
+reward :: POM m => Agent m -> Environment m -> AgentHistory -> m (Real m)
+reward agent env hist = ((<$> naturals) . approx) <$> stepA agent env hist where
+	approx oas n = pure (x + maxDiscountedReward n, x) where x = rewardsIn 0 (streamTake n oas)
+	rewardsIn i ((o, _):rest) = (discount i * rewardFrom o) + rewardsIn (succ i) rest
 	rewardsIn _ [] = 0
-	rewardsIn n ((o, _):rest) = (discount n * rewardFrom o) + rewardsIn (succ n) rest
 
 -- Finds a machine that outputs 1 with probability equal to the given real
-coinflipM :: POM m => Real m -> Machine
-coinflipM r = encodeB $ do
+coinflipM :: POM m => m (Real m) -> Machine
+coinflipM rM = encodeB $ do
+	r <- rM
 	randR <- genRandomReal
 	order <- compareR randR r
 	return $ if order == GT then One else Zero
 
 -- Outputs 1 if x > y, 0 if x < y, where x and y are expected utilities in [0,
 -- 1], using the oracle to check.
-chooseBetween :: POM m => Real m -> Real m -> m Bit
-chooseBetween x y = oracle (coinflipM biasedR) [] (1 / 2) where
-	biasedR = liftR1 (/ 2) (liftR1 (+1) (x `realAdd` y))
+chooseBetween :: POM m => m (Real m) -> m (Real m) -> m Bit
+chooseBetween xM yM = oracle (coinflipM biasedM) [] (1 / 2) where
+	biasedM = do
+		x <- xM
+		y <- yM
+		return $ liftR1 (/ 2) (liftR1 (+1) (x `realAdd` y))
 
 -- Outputs the bit with higher expected reward assuming that the future agent
 -- and environment act as given.
