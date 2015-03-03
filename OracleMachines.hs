@@ -65,6 +65,10 @@ encodeB = undefined
 len :: Machine -> Integer
 len (M i) = ceiling (logBase 2 (fromIntegral i) :: Double)
 
+-- The prior of a given machine according to a simplicity prior (with respect to `len`).
+prior :: Machine -> Rational
+prior m = 2 ^ negate (len m)
+
 -- TODO: this violates the condition that sum [2^(- len m) | m <-
 -- allMachines] == 1 assumption.
 allMachines :: Stream Machine
@@ -226,12 +230,11 @@ getStringProb bits m = realProduct [getProb bit prev m | (prev, bit) <- events b
 pOverMachines :: POM m => (Machine -> Real m) -> Real m
 pOverMachines bias = nthApprox <$> makeStream succ 0 where
 	nthApprox n = do
-		let ms = streamTake n allMachines
-		let measures = [2 ^ negate (len m) | m <- ms]
-		bounds <- sequence [streamGet n $ bias m | m <- ms]
-		let upper = sum [m * hi | (m, (hi, _)) <- zip measures bounds]
-		let lower = sum [m * lo | (m, (_, lo)) <- zip measures bounds]
-		pure (1 - sum measures + upper, lower)
+		let machines = streamTake n allMachines
+		bounds <- sequence [streamGet n $ bias m | m <- machines]
+		let upper = sum [prior m * hi | (m, (hi, _)) <- zip machines bounds]
+		let lower = sum [prior m * lo | (m, (_, lo)) <- zip machines bounds]
+		pure (1 - sum (prior <$> machines) + upper, lower)
 
 -- Samples machines according to a simplicity prior biased by some measure on machines.
 -- The biaser should return a probability in [0, 1] for each machine.
@@ -239,10 +242,9 @@ sampleMachine :: POM m => (Machine -> Real m) -> m Machine
 sampleMachine bias = do
 	normalizationFactor <- dropZeroIntervals $ pOverMachines bias
 	rand <- genRandomReal
-	let likelihood m = bias m `realDiv` normalizationFactor
-	let machineProb m = liftR1 (2 ^ negate (len m) *) (likelihood m)
+	let likelihood m = liftR1 (prior m *) (bias m `realDiv` normalizationFactor)
 	let cascade prev (x:!xs) = let next = prev `realAdd` x in next :! cascade next xs
-	let cutoffs = cascade zeroR (machineProb <$> allMachines)
+	let cutoffs = cascade zeroR (likelihood <$> allMachines)
 	let isLessThanRand = fmap (== LT) . compareR rand
 	let decisionStream = streamZip allMachines (isLessThanRand <$> cutoffs)
 	fst <$> streamFindM snd decisionStream
