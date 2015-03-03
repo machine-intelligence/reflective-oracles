@@ -205,8 +205,8 @@ flipR r = do
 -- Finds the probability that a machine, run on a given input, outputs a given bit.
 -- Basically does binary refinement using the oracle.
 -- Generates a series of nested intervals.
-getProb :: POM m => [Bit] -> Machine -> Bit -> Real m
-getProb bits m bit = if bit == One then prob1 else oneMinus prob1 where
+getProb :: POM m => Bit -> [Bit] -> Machine -> Real m
+getProb bit bits m = if bit == One then prob1 else oneMinus prob1 where
 	prob1 = makeStream restrictInterval (pure (1, 0))
 	restrictInterval pbounds = do
 		(hi, lo) <- pbounds
@@ -216,7 +216,7 @@ getProb bits m bit = if bit == One then prob1 else oneMinus prob1 where
 
 -- Finds the probability that a machine would have output a given bit sequence.
 getStringProb :: POM m => [Bit] -> Machine -> Real m
-getStringProb bits m = realProduct [getProb prev m bit | (prev, bit) <- events bits]
+getStringProb bits m = realProduct [getProb bit prev m | (prev, bit) <- events bits]
 
 -- Given a measure of how likely each machine is to accept x (in some abstract
 -- fashion) and x, this function generates the generic probability (over all
@@ -255,8 +255,7 @@ sampleMachine bias = do
 -- predicts the behavior of each machine in proportion to its posterior
 -- probability given the bits seen so far.
 solomonoffInduction :: POM m => [Bit] -> m Bit
-solomonoffInduction bs = pick >>= \m -> flipR (getProb bs m One) where
-	pick = sampleMachine $ getStringProb bs
+solomonoffInduction bs = flipR . getProb One bs =<< sampleMachine (getStringProb bs)
 
 -- Actions and Observations are bitstrings.
 -- You must use a prefix-free encoding.
@@ -329,7 +328,7 @@ events xs = [(take n xs, xs !! n) | n <- [0 .. pred $ length xs]]
 -- Given a machine and a list of OA pairs, compute the probability that that
 -- machine would have produced those observations (given those actions).
 getHistProb :: POM m => History -> Machine -> Real m
-getHistProb rhist m = realProduct [getProb bs m b | (bs, b) <- bitEvents] where
+getHistProb rhist m = realProduct [getProb b bs m | (bs, b) <- bitEvents] where
 	obsEvents = second fst <$> events (reverse rhist)
 	bitEvents = concatMap (uncurry o2b) obsEvents
 	o2b h o = first (histStr h ++) <$> events o
@@ -347,14 +346,14 @@ envInductor :: POM m => EnvHistory -> m (Machine, Bit)
 envInductor (EnvHistory bits mm hist) = getM >>= \m -> (m,) <$> predict m where
 	-- Note that if we need to sample a new machine, bits must be [].
 	getM = maybe (sampleMachine $ getHistProb hist) return mm
-	predict m = flipR (getProb (histStr hist ++ bits) m One)
+	predict = flipR . getProb One (histStr hist ++ bits)
 
 -- Runs the interaction of an agent with an environment, starting with an
 -- environment (which may be partway through outputting an observation).
 interactE :: POM m => Agent m -> Environment m -> EnvHistory -> m (Stream OA)
 interactE agent env hist = if isObservation $ partialO hist then a else e where
 	a = interactA agent env newAhist
-	e = env hist >>= (interactE agent env . newEhist)
+	e = env hist >>= interactE agent env . newEhist
 	newAhist = AgentHistory [] (partialO hist) (prevHistE hist)
 	newEhist (m, bit) = hist{partialO = bit : partialO hist, currentM = Just m}
 
@@ -363,7 +362,7 @@ interactE agent env hist = if isObservation $ partialO hist then a else e where
 interactA :: POM m => Agent m -> Environment m -> AgentHistory -> m (Stream OA)
 interactA agent env hist = if isAction $ partialA hist then e else a where
 	e = ((currentO hist, partialA hist):!) <$> interactE agent env newEhist
-	a = agent hist >>= (interactA agent env . newAhist)
+	a = agent hist >>= interactA agent env . newAhist
 	newEhist = EnvHistory [] Nothing $ (currentO hist, partialA hist) : prevHistA hist
 	newAhist bit = hist{partialA = bit : partialA hist}
 
