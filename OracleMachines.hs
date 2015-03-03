@@ -167,14 +167,17 @@ dropZeroIntervals r@(x:!xs) = do
 	(_, lo) <- x
 	if lo == 0 then dropZeroIntervals xs else return r
 
-realDiv :: (Monad m, Applicative m) => Real m -> Real m -> Real m
-realDiv = liftR2 (/)
-
 realAdd :: (Monad m, Applicative m) => Real m -> Real m -> Real m
 realAdd = liftR2 (+)
 
+realSub :: (Monad m, Applicative m) => Real m -> Real m -> Real m
+realSub = liftR2 (-)
+
 realMul :: (Monad m, Applicative m) => Real m -> Real m -> Real m
 realMul = liftR2 (*)
+
+realDiv :: (Monad m, Applicative m) => Real m -> Real m -> Real m
+realDiv = liftR2 (/)
 
 compareR :: Monad m => Real m -> Real m -> m Ordering
 compareR (x:!xs) (y:!ys) = do
@@ -405,7 +408,7 @@ chooseBetween xM yM = oracle (coinflipM biasedM) [] (1 / 2) where
 	biasedM = do
 		x <- xM
 		y <- yM
-		return $ liftR1 (/ 2) (liftR1 (+1) (x `realAdd` y))
+		return $ liftR1 (/ 2) (liftR1 (+1) (x `realSub` y))
 
 -- Outputs the bit with higher expected reward assuming that the future agent
 -- and environment act as given.
