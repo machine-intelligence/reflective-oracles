@@ -1,7 +1,8 @@
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE TupleSections #-}
-module SolomonoffInduction (solomonoffInduction, aixi) where
+module OracleMachines where
 import Prelude hiding (Real, interact)
+import Control.Arrow (first, second)
 import Control.Applicative
 import System.Random (randomRIO)
 
@@ -38,6 +39,9 @@ streamZipWith f (x :! xs) (y :! ys) = f x y :! streamZipWith f xs ys
 streamZip :: Stream a -> Stream b -> Stream (a, b)
 streamZip = streamZipWith (,)
 
+streamFindM :: Monad m => (a -> m Bool) -> Stream a -> m a
+streamFindM predM (x:!xs) = ifM (predM x) (return x) (streamFindM predM xs)
+
 -- A bit datatype.
 -- We could just use Bool, but it's nice to leverage the type system where possible.
 data Bit = Zero | One deriving (Eq, Ord, Read, Show, Enum)
@@ -50,6 +54,11 @@ fromBool False = Zero
 -- Assume any machine can be encoded as an integer.
 newtype Machine = M Integer deriving (Eq, Read, Show)
 
+-- Probabilistic orcale machines returning bits can be encoded as machines.
+-- In theory. You have to provide your own encoding, though.
+encodeB :: POM m => m Bit -> Machine
+encodeB = undefined
+
 -- This will be used to define a simplicity prior.
 -- We should be careful to pick an encoding of machines such that the sum of
 -- 2^(- len m) for all m sums to 1. Right now we won't worry too much about that.
@@ -59,7 +68,7 @@ len (M i) = ceiling (logBase 2 (fromIntegral i) :: Double)
 -- TODO: this violates the condition that sum [2^(- len m) | m <-
 -- allMachines] == 1 assumption.
 allMachines :: Stream Machine
-allMachines = M <$> makeStream (+1) 0
+allMachines = M <$> makeStream succ 0
 
 -- Probabilistic oracle machines.
 -- Remember, these are Turing machines that can flip coins and call oracles.
@@ -196,8 +205,8 @@ flipR r = do
 -- Finds the probability that a machine, run on a given input, outputs a given bit.
 -- Basically does binary refinement using the oracle.
 -- Generates a series of nested intervals.
-getProb :: POM m => Machine -> [Bit] -> Bit -> Real m
-getProb m bits bit = if bit == One then prob1 else oneMinus prob1 where
+getProb :: POM m => [Bit] -> Machine -> Bit -> Real m
+getProb bits m bit = if bit == One then prob1 else oneMinus prob1 where
 	prob1 = makeStream restrictInterval (pure (1, 0))
 	restrictInterval pbounds = do
 		(hi, lo) <- pbounds
@@ -206,24 +215,37 @@ getProb m bits bit = if bit == One then prob1 else oneMinus prob1 where
 		return $ if ans == One then (hi, mid) else (mid, lo)
 
 -- Finds the probability that a machine would have output a given bit sequence.
-getStringProb :: POM m => Machine -> [Bit] -> Real m
-getStringProb m bs = realProduct [getProb m bs' b' | (bs', b') <- observations]
-	where observations = [(take n bs, bs !! n) | n <- [0 .. length bs - 1]]
+getStringProb :: POM m => [Bit] -> Machine -> Real m
+getStringProb bits m = realProduct [getProb prev m bit | (prev, bit) <- events bits]
 
 -- Given a measure of how likely each machine is to accept x (in some abstract
 -- fashion) and x, this function generates the generic probability (over all
 -- machines) of ``accepting x."
 -- Translation: this can be used to figure out the probability of a given
 -- string being generated *in general*.
-pOverMachines :: POM m => (Machine -> x -> Real m) -> x -> Real m
-pOverMachines f x = nthApprox <$> makeStream (+1) 0 where
+pOverMachines :: POM m => (Machine -> Real m) -> Real m
+pOverMachines bias = nthApprox <$> makeStream succ 0 where
 	nthApprox n = do
 		let ms = streamTake n allMachines
 		let measures = [2 ^ negate (len m) | m <- ms]
-		bounds <- sequence [streamGet n $ f m x | m <- ms]
+		bounds <- sequence [streamGet n $ bias m | m <- ms]
 		let upper = sum [m * hi | (m, (hi, _)) <- zip measures bounds]
 		let lower = sum [m * lo | (m, (_, lo)) <- zip measures bounds]
 		pure (1 - sum measures + upper, lower)
+
+-- Samples machines according to a simplicity prior biased by some measure on machines.
+-- The biaser should return a probability in [0, 1] for each machine.
+sampleMachine :: POM m => (Machine -> Real m) -> m Machine
+sampleMachine bias = do
+	normalizationFactor <- dropZeroIntervals $ pOverMachines bias
+	rand <- genRandomReal
+	let likelihood m = bias m `realDiv` normalizationFactor
+	let machineProb m = liftR1 (2 ^ negate (len m) *) (likelihood m)
+	let cascade prev (x:!xs) = let next = prev `realAdd` x in next :! cascade next xs
+	let cutoffs = cascade zeroR (machineProb <$> allMachines)
+	let isLessThanRand = fmap (== LT) . compareR rand
+	let decisionStream = streamZip allMachines (isLessThanRand <$> cutoffs)
+	fst <$> streamFindM snd decisionStream
 
 -- Finally, the definition of Solomonoff induction.
 -- Basically, it selects a machine according to both its simplicity-weighted
@@ -231,147 +253,157 @@ pOverMachines f x = nthApprox <$> makeStream (+1) 0 where
 -- acts as that machine acts.
 -- Thus, this machine defines a probability distribution over bits that
 -- predicts the behavior of each machine in proportion to its posterior
--- probability.
+-- probability given the bits seen so far.
 solomonoffInduction :: POM m => [Bit] -> m Bit
-solomonoffInduction bs = pickM >>= \m -> flipR (getProb m bs One) where
-	pickM = do
-		normalizationFactor <- dropZeroIntervals $ pOverMachines getStringProb bs
-		rand <- genRandomReal
-		let likelihood m = getStringProb m bs `realDiv` normalizationFactor
-		let machineProb m = liftR1 (2 ^ negate (len m) *) (likelihood m)
-		let probs = machineProb <$> allMachines
-		let cutoffs = go zeroR probs where
-			go k (x:!xs) = let k' = k `realAdd` x in k' :! go k' xs
-		let decisions = (fmap (== LT) . compareR rand) <$> cutoffs
-		let findMachine ((m, isSelected):!xs) = ifM isSelected (pure m) (findMachine xs)
-		findMachine $ streamZip allMachines decisions
+solomonoffInduction bs = pick >>= \m -> flipR (getProb bs m One) where
+	pick = sampleMachine $ getStringProb bs
 
-
+-- Actions and Observations are bitstrings.
+-- You must use a prefix-free encoding.
+-- Here we represent them as lists *built from the left*, which means that they
+-- must be prefix-free when *read from the right*.
 type Action = [Bit]
 type Observation = [Bit]
 
+-- You must define your action/observation encodings yourself.
+isAction, isObservation :: [Bit] -> Bool
+isAction = undefined
+isObservation = undefined
+
+-- After defining your observation format, you must also define the encoding of
+-- rewards within observations.
 rewardFrom :: Observation -> Rational
 rewardFrom = undefined
 
--- Actions and Observations must use prefix-free encodings.
--- (These should return true if any prefix of Bit is an action;
--- this is not precisely indicated by the name.)
--- Except bits and observations are encoded from the back.
--- So I guess it's a postfix-free encoding?
--- Just say we build on the left and that it must be prefix free.
-isAction :: [Bit] -> Bool
-isAction = undefined
+-- The history generated will be a series of OA pairs.
+-- Note that history is generated from the left, so the oldest pair is at the
+-- end of the list.
+type OA = (Observation, Action)
+type History = [OA]
 
-isObservation :: [Bit] -> Bool
-isObservation = undefined
+-- Agents are run on a OAOA..OAO string (note the trailing O), and also the
+-- environment will be run until it finishes outputting an entire observation
+-- (bit by bit) before control is switched to the agent (which outputs an
+-- action bit by bit, etc.). We track those states with these two datatypes.
+data AgentHistory = AgentHistory
+	{ partialA :: [Bit]
+	, currentO :: Observation
+	, prevHistA :: History
+	} deriving (Eq, Show)
 
-type History = [(Observation, Action)]
-data AgentHistory = AgentHistory [Bit] Observation History deriving (Eq, Show)
-data EnvHistory = EnvHistory [Bit] (Maybe Machine) History deriving (Eq, Show)
+-- Constraint: The first field should be [] iff the second field is Nothing.
+data EnvHistory = EnvHistory
+	{ partialO :: [Bit]
+	, currentM :: Maybe Machine
+	, prevHistE :: History
+	} deriving (Eq, Show)
 
--- We'd like to add constraints saying that the bitstrings produced will always
--- form an observation/action, but for now we just assume that this is the case.
-type Environment m = EnvHistory -> m (Machine, Bit)
 type Agent m = AgentHistory -> m Bit
+-- An environment is a distribution over machines. Basically, the environment
+-- starts by sampling a machine from some distribution and acting like that
+-- machine, and it continues acting like that machine (rather than sampling
+-- a new one) until it finishes outputting an entire (multibit) observation.
+-- Constraint: If the second field in the EnvHistory is (Just machine) then
+-- that machine should be lifted into the first position of the tuple. (The
+-- envirnoment only picks new machines when it is between whole observations.)
+type Environment m = EnvHistory -> m (Machine, Bit)
 
-gamma :: Rational
-gamma = undefined -- TODO: Consider parameterizing this.
+-- TODO: Consider parameterizing this.
+discountFactor :: Rational
+discountFactor = undefined
 
+-- TODO: What's the closed form equation for \sum_{t=n}^{\infty} \gamma^t, again?
 maxDiscountedReward :: Integer -> Rational
-maxDiscountedReward = undefined -- TODO: Find the closed form equation for \sum_{t=n}^{\infty} \gamma^t
+maxDiscountedReward = undefined
 
 discount :: Integer -> Rational
-discount n = gamma ^ n
+discount n = discountFactor ^ n
 
-getEnvProb :: POM m => Machine -> History -> Observation -> Real m
-getEnvProb m hist o = realProduct [getProb m bs b | (bs, b) <- envActs] where
-	envActs :: [([Bit], Bit)]
-	envActs = concatMap (uncurry acts) ohs
-	rh :: History
-	rh = reverse hist
-	ohs :: [(History, Observation)]
-	ohs = [(take n rh, fst $ rh !! n) | n <- [0 .. length rh - 1]] ++ [(rh, o)]
-	acts :: History -> Observation -> [([Bit], Bit)]
-	acts h ob = addOActs ob (histStr h)
-	addOActs :: Observation -> [Bit] -> [([Bit], Bit)]
-	addOActs ob bs = [(bs ++ (take n ob), ob !! n) | n <- [0 .. length ob - 1]]
+-- Given the list xs, walks back through it, generating
+-- (for each element x of xs) the pair (xs before x, x).
+-- This is useful when computing the probability that xs was generated, when
+-- P(x|xs before x) is known for each x.
+events :: [a] -> [([a], a)]
+events xs = [(take n xs, xs !! n) | n <- [0 .. pred $ length xs]]
 
-getHistProb :: POM m => Machine -> History -> Real m
-getHistProb m h = realProduct [getEnvProb m h' o | (h', o) <- observations]
-	where observations = [(take n h, fst $ h !! n) | n <- [0 .. length h - 1]]
+-- Given a machine and a list of OA pairs, compute the probability that that
+-- machine would have produced those observations (given those actions).
+getHistProb :: POM m => History -> Machine -> Real m
+getHistProb rhist m = realProduct [getProb bs m b | (bs, b) <- bitEvents] where
+	obsEvents = second fst <$> events (reverse rhist)
+	bitEvents = concatMap (uncurry o2b) obsEvents
+	o2b h o = first (histStr h ++) <$> events o
 
+-- The bitstring corresponding to a OA sequence.
+-- Note that we can just append all the observations and actions together,
+-- because we assume prefix-free encodings.
 histStr :: History -> [Bit]
 histStr hist = concat [o ++ a | (o, a) <- reverse hist]
 
--- Unexpressed guarantee: Always picks the machine in EnvHistory if there was one.
+-- If we're between observations, this will sample a machine and start acting
+-- like that machine. Otherwise, it will continue outputting an observation
+-- (given the history) as if it was the chosen machine.
 envInductor :: POM m => EnvHistory -> m (Machine, Bit)
 envInductor (EnvHistory bits mm hist) = getM >>= \m -> (m,) <$> predict m where
-	getM = maybe pick return mm
-	-- Assertion: if we're calling pick, bits are nil.
-	pick = do
-		normalizationFactor <- dropZeroIntervals $ pOverMachines getHistProb hist
-		rand <- genRandomReal
-		let likelihood m = getHistProb m hist `realDiv` normalizationFactor
-		let machineProb m = liftR1 (2 ^ negate (len m) *) (likelihood m)
-		let probs = machineProb <$> allMachines
-		let cutoffs = go zeroR probs where
-			go k (x:!xs) = let k' = k `realAdd` x in k' :! go k' xs
-		let decisions = (fmap (== LT) . compareR rand) <$> cutoffs
-		let findMachine ((m, isSelected):!xs) = ifM isSelected (pure m) (findMachine xs)
-		findMachine $ streamZip allMachines decisions
-	predict m = flipR (getProb m (histStr hist ++ bits) One)
+	-- Note that if we need to sample a new machine, bits must be [].
+	getM = maybe (sampleMachine $ getHistProb hist) return mm
+	predict m = flipR (getProb (histStr hist ++ bits) m One)
 
-interactE :: POM m => Agent m -> Environment m -> EnvHistory
-	-> m (Stream (Observation, Action))
-interactE agent env eHist@(EnvHistory bits _ hist)
-	| isObservation bits = interactA agent env (AgentHistory [] bits hist)
-	| otherwise = do
-		(m, bit) <- env eHist
-		interactE agent env (EnvHistory (bit:bits) (Just m) hist)
+-- Runs the interaction of an agent with an environment, starting with an
+-- environment (which may be partway through outputting an observation).
+interactE :: POM m => Agent m -> Environment m -> EnvHistory -> m (Stream OA)
+interactE agent env hist = if isObservation $ partialO hist then a else e where
+	a = interactA agent env newAhist
+	e = env hist >>= (interactE agent env . newEhist)
+	newAhist = AgentHistory [] (partialO hist) (prevHistE hist)
+	newEhist (m, bit) = hist{partialO = bit : partialO hist, currentM = Just m}
 
-interactA :: POM m => Agent m -> Environment m -> AgentHistory
-	-> m (Stream (Observation, Action))
-interactA agent env aHist@(AgentHistory bits o hist)
-	| isAction bits = do
-		let next = (o, bits)
-		rest <- interactE agent env (EnvHistory [] Nothing (next:hist))
-		return (next:!rest)
-	| otherwise = do
-		bit <- agent aHist
-		interactA agent env (AgentHistory (bit:bits) o hist)
+-- Runs the interaction of an agent with an environment, starting with an agent
+-- (which may be partway through outputting an action.)
+interactA :: POM m => Agent m -> Environment m -> AgentHistory -> m (Stream OA)
+interactA agent env hist = if isAction $ partialA hist then e else a where
+	e = ((currentO hist, partialA hist):!) <$> interactE agent env newEhist
+	a = agent hist >>= (interactA agent env . newAhist)
+	newEhist = EnvHistory [] Nothing $ (currentO hist, partialA hist) : prevHistA hist
+	newAhist bit = hist{partialA = bit : partialA hist}
 
-interact :: POM m => Agent m -> Environment m -> AgentHistory
-	-> m (Stream (Observation, Action))
-interact agent env aHist@(AgentHistory bits o hist)
-	| isAction bits = interactE agent env (EnvHistory [] Nothing ((o, bits):hist))
-	| otherwise = interactA agent env aHist
+-- Runs the interaction of an agent with an environment, starting with the
+-- environment outputting a fresh observation.
+interact :: POM m => Agent m -> Environment m -> History -> m (Stream OA)
+interact agent env hist = interactE agent env (EnvHistory [] Nothing hist)
 
-reward :: POM m => Agent m -> Environment m -> AgentHistory -> (Real m)
-reward agent env hist = approx <$> makeStream (+1) (0 :: Integer) where
+-- Computes the reward of an agent interacting with an environment.
+-- Computes better and better approximations to this sum (as a series of nested
+-- intervals). Guaranteed to converge (if rewards are on [0, 1]) due to
+-- time-discounting.
+reward :: POM m => Agent m -> Environment m -> AgentHistory -> Real m
+reward agent env hist = approx <$> makeStream succ (0 :: Integer) where
 	approx n = do
-		future <- interact agent env hist
+		future <- interactA agent env hist
 		let relevant = streamTake n future
 		return (rewardsIn n relevant + maxDiscountedReward n, rewardsIn n relevant)
-	rewardsIn :: Integer -> History -> Rational
 	rewardsIn _ [] = 0
-	rewardsIn n ((o, _):rest) = ((discount n) * (rewardFrom o)) + rewardsIn (n+1) rest
+	rewardsIn n ((o, _):rest) = (discount n * rewardFrom o) + rewardsIn (succ n) rest
 
--- f and g had better be in [0, 1]! TODO: Explain this better.
--- If f in [0, 1] and g in [0, 1] then this is a number in [0, 1] that is >1/2
--- if f is larger, and less than 1/2 if g is larger.
-bias :: POM m => (Real m) -> (Real m) -> (Real m)
-bias x y = (liftR1 (/ 2) (liftR1 (+1) (x `realAdd` y)))
+-- Finds a machine that outputs 1 with probability equal to the given real
+coinflipM :: POM m => Real m -> Machine
+coinflipM r = encodeB $ do
+	randR <- genRandomReal
+	order <- compareR randR r
+	return $ if order == GT then One else Zero
 
--- Finds a machine that outputs this real number.
-coinflipM :: (Real m) -> Machine
-coinflipM = undefined
+-- Outputs 1 if x > y, 0 if x < y, where x and y are expected utilities in [0,
+-- 1], using the oracle to check.
+chooseBetween :: POM m => Real m -> Real m -> m Bit
+chooseBetween x y = oracle (coinflipM biasedR) [] (1 / 2) where
+	biasedR = liftR1 (/ 2) (liftR1 (+1) (x `realAdd` y))
 
+-- Outputs the bit with higher expected reward assuming that the future agent
+-- and environment act as given.
 aixiTemplate :: POM m => Agent m -> Environment m -> AgentHistory -> m Bit
-aixiTemplate agent env (AgentHistory bits o hist)
-	| isAction bits = error "Agent called with malformed history."
-	| otherwise = do
-		let r x = reward agent env $ AgentHistory (bits ++ [x]) o hist
-		oracle (coinflipM $ bias (r One) (r Zero)) [] (1/2)
+aixiTemplate agent env hist = chooseBetween (xr One) (xr Zero) where
+	xr bit = reward agent env $ hist{partialA = bit : partialA hist}
 
+-- AIXI that expects itself to remain AIXI, starting with a Solomnooff distribution.
 aixi :: POM m => Agent m
 aixi = aixiTemplate aixi envInductor
