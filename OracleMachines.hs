@@ -76,8 +76,7 @@ len (M i) = ceiling (logBase 2 (fromIntegral i) :: Double)
 prior :: Machine -> Rational
 prior m = 2 ^ negate (len m)
 
--- TODO: this violates the condition that sum [2^(- len m) | m <-
--- allMachines] == 1 assumption.
+-- TODO: this violates the condition that sum [2^(- len m) | m <- allMachines] == 1.
 allMachines :: Stream Machine
 allMachines = M <$> naturals
 
